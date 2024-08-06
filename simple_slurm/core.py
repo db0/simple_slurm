@@ -50,13 +50,18 @@ class Slurm():
         # add provided arguments in constructor
         self.add_arguments(*args, **kwargs)
 
+        # contain a list of "single-line" commands to dispatch
+        self.run_cmds = []
+
     def __str__(self) -> str:
         '''Print the generated sbatch script.'''
-        return self.arguments()
+        return self.script()
 
     def __repr__(self) -> str:
         '''Print the argparse namespace.'''
-        return repr(vars(self.namespace))
+        params = dict(vars(self.namespace))  # make copy
+        params['run_cmds'] = self.run_cmds
+        return repr(params)
 
     def _add_one_argument(self, key: str, value: str):
         '''Parse the given key-value pair (the argument is given in key).'''
@@ -76,6 +81,24 @@ class Slurm():
             self._add_one_argument(key, value)
         return self
 
+    def add_cmd(self, *cmd_args: str):
+        '''Add a new command to the command list, it can be provided as a single
+        argument (ie. a string) or a collection of arguments (all converted to
+        strings and spaces are added in-between).
+
+        For example, these syntaxes are equivalent
+            > slurm.add_cmd('python main.py --input 1')
+            > slurm.add_cmd('python', 'main.py', '--input', 1)
+        '''
+        cmd = ' '.join([str(cmd) for cmd in cmd_args]).strip()
+        if len(cmd):
+            self.run_cmds.append(cmd)
+        return self
+
+    def reset_cmd(self):
+        '''Reset the command list'''
+        self.run_cmds = []
+
     @staticmethod
     def _valid_key(key: str) -> str:
         '''Long arguments (for slurm) constructed with '-' have been internally
@@ -83,21 +106,28 @@ class Slurm():
         '''
         return key.replace('_', '-')
 
-    def arguments(self, shell: str = '/bin/sh') -> str:
-        '''Generate the sbatch script for the current state of arguments.'''
-        args = (
-            f'#SBATCH --{self._valid_key(k):<19} {v}'
-            for k, v in vars(self.namespace).items() if v is not None
-        )
-        script_cmd = '\n'.join((f'#!{shell}', '', *args, ''))
-        return script_cmd
+    def script(self, shell: str = '/bin/sh', convert: bool = True):
+        '''Generate the sbatch script for the current arguments and commands'''
+
+        arguments = '\n'.join((
+            f'#!{shell}',
+            '',
+            *(
+                f'#SBATCH --{self._valid_key(k):<19} {v}'
+                for k, v in vars(self.namespace).items() if v is not None
+            ),
+        )) + '\n'
+        commands = '\n'.join([cmd.replace('$', '\\$') if convert else cmd
+                              for cmd in self.run_cmds])
+        script = '\n'.join((arguments,commands)).strip() + '\n'
+        return script
 
     def srun(self, run_cmd: str, srun_cmd: str = 'srun') -> int:
         '''Run the srun command with all the (previously) set arguments and
-        the provided command to in 'run_cmd'.
+        the provided command in 'run_cmd'.
         '''
         args = (
-            f'--{self._valid_key(k)}={v}'
+            f'--{self._valid_key(k)}' + f'={v}' if len(v) else ''
             for k, v in vars(self.namespace).items() if v is not None
         )
         cmd = ' '.join((srun_cmd, *args, run_cmd))
@@ -105,11 +135,18 @@ class Slurm():
         result = subprocess.run(cmd, shell=True, check=True)
         return result.returncode
 
-    def sbatch(self, run_cmd: str, convert: bool = True, verbose: bool = True,
-               sbatch_cmd: str = 'sbatch', shell: str = '/bin/sh') -> int:
+    def sbatch(self, *run_cmd: str, convert: bool = True,
+               verbose: bool = True, sbatch_cmd: str = 'sbatch',
+               shell: str = '/bin/sh') -> int:
         '''Run the sbatch command with all the (previously) set arguments and
-        the provided command to in 'run_cmd'.
+        the provided command in 'run_cmd' alongside with the previously set
+        commands using 'add_cmd'.
 
+        Note that 'run_cmd' can accept multiple arguments. Thus, any of the
+        other arguments must be given as key-value pairs :
+            > slurm.sbatch('python main.py')
+            > slurm.sbatch('python', 'main.py')
+            > slurm.sbatch('python', 'main.py', verbose=False)
         This function employs the 'here document' syntax, which requires that
         bash variables be scaped. This behavior is default, set 'convert'
         to False to disable it.
@@ -118,16 +155,16 @@ class Slurm():
             $ slurm_cmd << EOF
             > bash_script
             > run_command
-            >EOF
+            > EOF
 
         For such reason if any bash variable is employed by the 'run_command',
         the '$' should be scaped into '\$'. This behavior is default, set
         'convert' to False to disable it.
         '''
+        self.add_cmd(*run_cmd)
         cmd = '\n'.join((
             sbatch_cmd + ' << EOF',
-            self.arguments(shell),
-            run_cmd.replace('$', '\\$') if convert else run_cmd,
+            self.script(shell, convert),
             'EOF',
         ))
         result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE)
